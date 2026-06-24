@@ -40,6 +40,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-tokens", type=int, default=1024, help="Maximum number of prompt tokens to keep.")
     parser.add_argument("--max-new-tokens", type=int, default=50, help="Number of greedy continuation steps to test.")
+    parser.add_argument(
+        "--mode",
+        default="teacher-forced",
+        choices=["teacher-forced", "free-running"],
+        help="Whether compressed replay uses raw next tokens or feeds back its own greedy tokens.",
+    )
     return parser
 
 
@@ -215,7 +221,7 @@ def raw_greedy_generate(model, input_ids: torch.Tensor, attention_mask: torch.Te
     return generated_tokens, step_logits
 
 
-def teacher_forced_compressed_replay(
+def compressed_replay_generate(
     model,
     prompt_ids: torch.Tensor,
     raw_generated_tokens: list[int],
@@ -224,8 +230,9 @@ def teacher_forced_compressed_replay(
     k_bits: int,
     v_bits: int,
     group_size: int,
+    mode: str,
 ) -> tuple[list[int], list[torch.Tensor]]:
-    """Use raw tokens as context each step, but compute logits with reconstructed KV."""
+    """Run compressed replay in teacher-forced or free-running mode."""
 
     replay_tokens: list[int] = []
     replay_logits_per_step: list[torch.Tensor] = []
@@ -265,8 +272,15 @@ def teacher_forced_compressed_replay(
         replay_tokens.append(replay_token)
         replay_logits_per_step.append(replay_logits)
 
-        next_raw_token_tensor = torch.tensor([[raw_token]], device=context_ids.device)
-        context_ids = torch.cat([context_ids, next_raw_token_tensor], dim=1)
+        if mode == "teacher-forced":
+            next_token = raw_token
+        elif mode == "free-running":
+            next_token = replay_token
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
+
+        next_token_tensor = torch.tensor([[next_token]], device=context_ids.device)
+        context_ids = torch.cat([context_ids, next_token_tensor], dim=1)
 
     return replay_tokens, replay_logits_per_step
 
@@ -322,7 +336,7 @@ def main() -> int:
         attention_mask=attention_mask,
         max_new_tokens=args.max_new_tokens,
     )
-    replay_generated_tokens, replay_logits_per_step = teacher_forced_compressed_replay(
+    replay_generated_tokens, replay_logits_per_step = compressed_replay_generate(
         model=model,
         prompt_ids=input_ids,
         raw_generated_tokens=raw_generated_tokens,
@@ -331,6 +345,7 @@ def main() -> int:
         k_bits=args.k_bits,
         v_bits=args.v_bits,
         group_size=args.group_size,
+        mode=args.mode,
     )
 
     token_match_count = sum(int(raw_token == replay_token) for raw_token, replay_token in zip(raw_generated_tokens, replay_generated_tokens))
@@ -354,7 +369,7 @@ def main() -> int:
     raw_text = tokenizer.decode(raw_generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     replay_text = tokenizer.decode(replay_generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
-    print("mode: teacher-forced compressed replay")
+    print(f"mode: {args.mode} compressed replay")
     print(f"model name: {args.model}")
     print(f"prompt token count: {input_ids.shape[-1]}")
     print(f"selected K codec: {args.k_codec} int{args.k_bits}")
