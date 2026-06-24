@@ -23,6 +23,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct", help="Hugging Face model name or path.")
     parser.add_argument("--prompt-file", default="prompts/code_prompt.txt", help="Prompt file to analyze.")
+    parser.add_argument("--k-codec", default="prev-residual", choices=["prev-residual"], help="K codec to use.")
+    parser.add_argument(
+        "--v-codec",
+        default="anchor-residual",
+        choices=["anchor-residual"],
+        help="V codec to use.",
+    )
+    parser.add_argument("--k-bits", type=int, default=8, choices=[8], help="Quantization bit width for K.")
+    parser.add_argument("--v-bits", type=int, default=4, choices=[8, 4], help="Quantization bit width for V.")
     parser.add_argument("--group-size", type=int, default=8, help="Token group size for the codecs.")
     parser.add_argument(
         "--device",
@@ -49,25 +58,47 @@ def tokenize_prompt(tokenizer, prompt: str, max_tokens: int, device: torch.devic
 
 def compress_prefix_cache(
     prefix_past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    k_codec: str,
+    v_codec: str,
+    k_bits: int,
+    v_bits: int,
     group_size: int,
-) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
-    """Reconstruct prefix KV with the current best codec choice."""
+) -> tuple[tuple[tuple[torch.Tensor, torch.Tensor], tuple[float, float, float, float]], ...]:
+    """Reconstruct prefix KV and return per-layer raw/codec byte estimates."""
 
     reconstructed_layers = []
     for raw_k, raw_v in prefix_past_key_values:
-        reconstructed_k = encode_previous_token_residual(
+        if k_codec != "prev-residual":
+            raise ValueError(f"Unsupported K codec: {k_codec}")
+        if v_codec != "anchor-residual":
+            raise ValueError(f"Unsupported V codec: {v_codec}")
+
+        k_result = encode_previous_token_residual(
             raw_k,
-            bit_width=8,
+            bit_width=k_bits,
             group_size=group_size,
-            codec_name="k-prev-int8",
-        ).reconstructed.to(dtype=raw_k.dtype)
-        reconstructed_v = encode_anchor_group_residual(
+            codec_name=f"k-{k_codec}-int{k_bits}",
+        )
+        v_result = encode_anchor_group_residual(
             raw_v,
-            bit_width=4,
+            bit_width=v_bits,
             group_size=group_size,
-            codec_name="v-anchor-int4",
-        ).reconstructed.to(dtype=raw_v.dtype)
-        reconstructed_layers.append((reconstructed_k, reconstructed_v))
+            codec_name=f"v-{v_codec}-int{v_bits}",
+        )
+        reconstructed_layers.append(
+            (
+                (
+                    k_result.reconstructed.to(dtype=raw_k.dtype),
+                    v_result.reconstructed.to(dtype=raw_v.dtype),
+                ),
+                (
+                    float(k_result.raw_bytes),
+                    float(k_result.codec_bytes),
+                    float(v_result.raw_bytes),
+                    float(v_result.codec_bytes),
+                ),
+            )
+        )
     return tuple(reconstructed_layers)
 
 
@@ -172,6 +203,10 @@ def teacher_forced_compressed_replay(
     model,
     prompt_ids: torch.Tensor,
     raw_generated_tokens: list[int],
+    k_codec: str,
+    v_codec: str,
+    k_bits: int,
+    v_bits: int,
     group_size: int,
 ) -> tuple[list[int], list[torch.Tensor]]:
     """Use raw tokens as context each step, but compute logits with reconstructed KV."""
@@ -197,12 +232,16 @@ def teacher_forced_compressed_replay(
 
         reconstructed_prefix_kv = compress_prefix_cache(
             normalize_past_key_values(prefix_outputs.past_key_values),
+            k_codec=k_codec,
+            v_codec=v_codec,
+            k_bits=k_bits,
+            v_bits=v_bits,
             group_size=group_size,
         )
         replay_logits = replay_one_step_with_reconstructed_prefix(
             model=model,
             current_token_id=current_token_id,
-            reconstructed_prefix_kv=reconstructed_prefix_kv,
+            reconstructed_prefix_kv=tuple(layer_pair for layer_pair, _ in reconstructed_prefix_kv),
             prefix_length=int(prefix_ids.shape[-1]),
         )
 
@@ -238,6 +277,29 @@ def main() -> int:
     if input_ids.shape[-1] < 2:
         raise ValueError("Need at least two prompt tokens for teacher-forced replay.")
 
+    with torch.no_grad():
+        prompt_outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+        )
+
+    prompt_codec_layers = compress_prefix_cache(
+        normalize_past_key_values(prompt_outputs.past_key_values),
+        k_codec=args.k_codec,
+        v_codec=args.v_codec,
+        k_bits=args.k_bits,
+        v_bits=args.v_bits,
+        group_size=args.group_size,
+    )
+    total_raw_k_bytes = sum(layer_bytes[0] for _, layer_bytes in prompt_codec_layers)
+    total_codec_k_bytes = sum(layer_bytes[1] for _, layer_bytes in prompt_codec_layers)
+    total_raw_v_bytes = sum(layer_bytes[2] for _, layer_bytes in prompt_codec_layers)
+    total_codec_v_bytes = sum(layer_bytes[3] for _, layer_bytes in prompt_codec_layers)
+    estimated_full_kv_compression_ratio = (total_raw_k_bytes + total_raw_v_bytes) / (
+        total_codec_k_bytes + total_codec_v_bytes
+    )
+
     raw_generated_tokens, raw_logits_per_step = raw_greedy_generate(
         model=model,
         input_ids=input_ids,
@@ -248,6 +310,10 @@ def main() -> int:
         model=model,
         prompt_ids=input_ids,
         raw_generated_tokens=raw_generated_tokens,
+        k_codec=args.k_codec,
+        v_codec=args.v_codec,
+        k_bits=args.k_bits,
+        v_bits=args.v_bits,
         group_size=args.group_size,
     )
 
@@ -275,8 +341,11 @@ def main() -> int:
     print("mode: teacher-forced compressed replay")
     print(f"model name: {args.model}")
     print(f"prompt token count: {input_ids.shape[-1]}")
+    print(f"selected K codec: {args.k_codec} int{args.k_bits}")
+    print(f"selected V codec: {args.v_codec} int{args.v_bits}")
     print(f"group size: {args.group_size}")
     print(f"max new tokens: {args.max_new_tokens}")
+    print(f"estimated full KV compression ratio: {estimated_full_kv_compression_ratio:.4f}")
     print()
     print("raw generated text:")
     print(raw_text)
