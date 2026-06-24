@@ -51,8 +51,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def format_shape(tensor: torch.Tensor) -> str:
-    return "x".join(str(dim) for dim in tensor.shape)
+def format_shape(value: torch.Tensor | torch.Size | tuple[int, ...] | list[int]) -> str:
+    """Format either a tensor or a shape-like object as `d0xd1x...`."""
+
+    shape = value.shape if hasattr(value, "shape") else value
+    return "x".join(str(dim) for dim in shape)
 
 
 def get_model_parameter_device(model: torch.nn.Module) -> torch.device:
