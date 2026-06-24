@@ -2,6 +2,7 @@
 
 __all__ = [
     "capture",
+    "codec",
     "metrics",
     "predictors",
 ]

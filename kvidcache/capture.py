@@ -20,6 +20,8 @@ class CaptureResult:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...]
+    layer_attention_inputs: tuple[torch.Tensor, ...] | None = None
+    layer_position_embeddings: tuple[tuple[torch.Tensor, torch.Tensor] | None, ...] | None = None
 
 
 def load_prompt(prompt_file: str | Path) -> str:
@@ -35,7 +37,7 @@ def load_model_and_tokenizer(model_name: str, device: torch.device) -> tuple[Any
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float32 if device.type == "cpu" else torch.float16,
+        dtype=torch.float32 if device.type == "cpu" else torch.float16,
     )
     model.to(device)
     model.eval()
@@ -107,6 +109,7 @@ def capture_prompt_kv(
     device: torch.device,
     model_name: str,
     max_tokens: int,
+    capture_attention_inputs: bool = False,
 ) -> CaptureResult:
     """Run the prompt through the model and return the resulting KV cache."""
 
@@ -120,11 +123,51 @@ def capture_prompt_kv(
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded["attention_mask"].to(device)
 
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        use_cache=True,
-    )
+    layer_attention_inputs: list[torch.Tensor | None] | None = None
+    layer_position_embeddings: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None
+    hook_handles = []
+
+    if capture_attention_inputs:
+        if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+            raise ValueError("Model does not expose `model.layers`, so attention input capture is unavailable.")
+
+        num_layers = len(model.model.layers)
+        layer_attention_inputs = [None] * num_layers
+        layer_position_embeddings = [None] * num_layers
+
+        for layer_index, decoder_layer in enumerate(model.model.layers):
+            def capture_hook(module, args, kwargs, current_layer_index: int = layer_index):
+                hidden_states = kwargs.get("hidden_states", args[0] if args else None)
+                if hidden_states is None:
+                    raise ValueError(f"Could not capture hidden states for layer {current_layer_index}.")
+
+                layer_attention_inputs[current_layer_index] = hidden_states.detach()
+
+                position_embeddings = kwargs.get("position_embeddings")
+                if position_embeddings is not None:
+                    cos, sin = position_embeddings
+                    layer_position_embeddings[current_layer_index] = (cos.detach(), sin.detach())
+
+            hook_handles.append(
+                decoder_layer.self_attn.register_forward_pre_hook(capture_hook, with_kwargs=True)
+            )
+
+    try:
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+        )
+    finally:
+        for handle in hook_handles:
+            handle.remove()
+
+    if capture_attention_inputs:
+        if layer_attention_inputs is None or layer_position_embeddings is None:
+            raise ValueError("Attention input capture was requested but did not initialize correctly.")
+
+        if any(item is None for item in layer_attention_inputs):
+            raise ValueError("Attention input capture was incomplete for one or more layers.")
 
     return CaptureResult(
         model_name=model_name,
@@ -133,4 +176,8 @@ def capture_prompt_kv(
         input_ids=input_ids,
         attention_mask=attention_mask,
         past_key_values=_normalize_past_key_values(outputs.past_key_values),
+        layer_attention_inputs=tuple(layer_attention_inputs) if layer_attention_inputs is not None else None,
+        layer_position_embeddings=(
+            tuple(layer_position_embeddings) if layer_position_embeddings is not None else None
+        ),
     )
