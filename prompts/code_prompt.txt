@@ -1,0 +1,3 @@
+Write a small Python function that parses a CSV file with headers, validates that each row has the same number of columns, and returns a list of dictionaries.
+
+Keep the implementation clean and include a short explanation of the design choices.
