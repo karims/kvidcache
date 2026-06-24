@@ -15,7 +15,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from kvidcache.capture import load_model_and_tokenizer, load_prompt, normalize_past_key_values, prepare_prompt_text
-from kvidcache.codec import encode_anchor_group_residual, encode_previous_token_residual
+from kvidcache.codec import encode_anchor_group_residual, encode_previous_token_residual, encode_raw_tensor
 from kvidcache.metrics import cosine_similarity
 
 
@@ -23,16 +23,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct", help="Hugging Face model name or path.")
     parser.add_argument("--prompt-file", default="prompts/code_prompt.txt", help="Prompt file to analyze.")
-    parser.add_argument("--k-codec", default="prev-residual", choices=["prev-residual"], help="K codec to use.")
+    parser.add_argument("--k-codec", default="prev-residual", choices=["raw", "prev-residual"], help="K codec to use.")
     parser.add_argument(
         "--v-codec",
         default="anchor-residual",
-        choices=["anchor-residual"],
+        choices=["raw", "anchor-residual"],
         help="V codec to use.",
     )
-    parser.add_argument("--k-bits", type=int, default=8, choices=[8], help="Quantization bit width for K.")
-    parser.add_argument("--v-bits", type=int, default=4, choices=[8, 4], help="Quantization bit width for V.")
-    parser.add_argument("--group-size", type=int, default=8, help="Token group size for the codecs.")
+    parser.add_argument("--k-bits", type=int, default=8, choices=[16, 8, 6, 4], help="Quantization bit width for K.")
+    parser.add_argument("--v-bits", type=int, default=4, choices=[16, 8, 6, 4], help="Quantization bit width for V.")
+    parser.add_argument("--group-size", type=int, default=8, choices=[4, 8, 16, 32, 64, 128], help="Token group size for the codecs.")
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -68,23 +68,39 @@ def compress_prefix_cache(
 
     reconstructed_layers = []
     for raw_k, raw_v in prefix_past_key_values:
-        if k_codec != "prev-residual":
+        if k_codec == "raw":
+            k_result = encode_raw_tensor(
+                raw_k,
+                bit_width=k_bits,
+                group_size=group_size,
+                codec_name=f"k-raw-int{k_bits}",
+            )
+        elif k_codec == "prev-residual":
+            k_result = encode_previous_token_residual(
+                raw_k,
+                bit_width=k_bits,
+                group_size=group_size,
+                codec_name=f"k-{k_codec}-int{k_bits}",
+            )
+        else:
             raise ValueError(f"Unsupported K codec: {k_codec}")
-        if v_codec != "anchor-residual":
-            raise ValueError(f"Unsupported V codec: {v_codec}")
 
-        k_result = encode_previous_token_residual(
-            raw_k,
-            bit_width=k_bits,
-            group_size=group_size,
-            codec_name=f"k-{k_codec}-int{k_bits}",
-        )
-        v_result = encode_anchor_group_residual(
-            raw_v,
-            bit_width=v_bits,
-            group_size=group_size,
-            codec_name=f"v-{v_codec}-int{v_bits}",
-        )
+        if v_codec == "raw":
+            v_result = encode_raw_tensor(
+                raw_v,
+                bit_width=v_bits,
+                group_size=group_size,
+                codec_name=f"v-raw-int{v_bits}",
+            )
+        elif v_codec == "anchor-residual":
+            v_result = encode_anchor_group_residual(
+                raw_v,
+                bit_width=v_bits,
+                group_size=group_size,
+                codec_name=f"v-{v_codec}-int{v_bits}",
+            )
+        else:
+            raise ValueError(f"Unsupported V codec: {v_codec}")
         reconstructed_layers.append(
             (
                 (

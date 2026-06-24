@@ -18,9 +18,8 @@ if str(REPO_ROOT) not in sys.path:
 from kvidcache.capture import capture_prompt_kv, load_model_and_tokenizer, load_prompt
 from kvidcache.codec import (
     encode_anchor_group_residual,
-    encode_block_dct,
     encode_previous_token_residual,
-    encode_raw_baseline,
+    encode_raw_tensor,
     qk_logit_mae,
 )
 
@@ -29,7 +28,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct", help="Hugging Face model name or path.")
     parser.add_argument("--prompt-file", default="prompts/code_prompt.txt", help="Prompt file to analyze.")
-    parser.add_argument("--group-size", type=int, default=16, help="Token block size for predictors and quant scales.")
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        default=16,
+        choices=[4, 8, 16, 32, 64, 128],
+        help="Token block size for predictors and quant scales.",
+    )
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -60,21 +65,27 @@ def compute_last_token_query(model, layer_index: int, layer_input: torch.Tensor,
 
 def build_k_codecs(group_size: int):
     return [
+        ("raw", 16, lambda tensor: encode_raw_tensor(tensor, 16, group_size, "k-raw-int16")),
+        ("raw", 8, lambda tensor: encode_raw_tensor(tensor, 8, group_size, "k-raw-int8")),
+        ("raw", 6, lambda tensor: encode_raw_tensor(tensor, 6, group_size, "k-raw-int6")),
+        ("raw", 4, lambda tensor: encode_raw_tensor(tensor, 4, group_size, "k-raw-int4")),
+        ("prev-residual", 16, lambda tensor: encode_previous_token_residual(tensor, 16, group_size, "k-prev-int16")),
         ("prev-residual", 8, lambda tensor: encode_previous_token_residual(tensor, 8, group_size, "k-prev-int8")),
+        ("prev-residual", 6, lambda tensor: encode_previous_token_residual(tensor, 6, group_size, "k-prev-int6")),
         ("prev-residual", 4, lambda tensor: encode_previous_token_residual(tensor, 4, group_size, "k-prev-int4")),
-        ("prev-residual", 3, lambda tensor: encode_previous_token_residual(tensor, 3, group_size, "k-prev-int3")),
     ]
 
 
 def build_v_codecs(group_size: int):
     return [
-        ("raw", 16, lambda tensor: encode_raw_baseline(tensor, "v-raw")),
-        ("prev-residual", 8, lambda tensor: encode_previous_token_residual(tensor, 8, group_size, "v-prev-int8")),
-        ("prev-residual", 4, lambda tensor: encode_previous_token_residual(tensor, 4, group_size, "v-prev-int4")),
+        ("raw", 16, lambda tensor: encode_raw_tensor(tensor, 16, group_size, "v-raw-int16")),
+        ("raw", 8, lambda tensor: encode_raw_tensor(tensor, 8, group_size, "v-raw-int8")),
+        ("raw", 6, lambda tensor: encode_raw_tensor(tensor, 6, group_size, "v-raw-int6")),
+        ("raw", 4, lambda tensor: encode_raw_tensor(tensor, 4, group_size, "v-raw-int4")),
+        ("anchor-residual", 16, lambda tensor: encode_anchor_group_residual(tensor, 16, group_size, "v-anchor-int16")),
         ("anchor-residual", 8, lambda tensor: encode_anchor_group_residual(tensor, 8, group_size, "v-anchor-int8")),
+        ("anchor-residual", 6, lambda tensor: encode_anchor_group_residual(tensor, 6, group_size, "v-anchor-int6")),
         ("anchor-residual", 4, lambda tensor: encode_anchor_group_residual(tensor, 4, group_size, "v-anchor-int4")),
-        ("block-dct", 8, lambda tensor: encode_block_dct(tensor, 8, group_size, "v-dct-int8")),
-        ("block-dct", 4, lambda tensor: encode_block_dct(tensor, 4, group_size, "v-dct-int4")),
     ]
 
 

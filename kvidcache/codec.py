@@ -12,7 +12,9 @@ from .metrics import cosine_similarity, mean_absolute_error, mean_squared_energy
 
 RAW_DTYPE_BYTES = 2
 BIT_WIDTH_TO_BYTES_PER_VALUE = {
+    16: 2.0,
     8: 1.0,
+    6: 0.75,
     4: 0.5,
     3: 0.375,
 }
@@ -73,6 +75,25 @@ def _raw_bytes(tensor: torch.Tensor) -> int:
 
 
 def _make_identity_codec_result(tensor: torch.Tensor, codec_name: str) -> TensorCodecResult:
+    raw_bytes = _raw_bytes(tensor)
+    return TensorCodecResult(
+        codec_name=codec_name,
+        quantized_values=torch.empty_like(tensor[..., :0, :], dtype=torch.int8),
+        scales=torch.empty((tensor.shape[0], tensor.shape[1], 0), dtype=torch.float32, device=tensor.device),
+        reconstructed=tensor.float().clone(),
+        mse=0.0,
+        cosine_similarity=1.0,
+        raw_bytes=raw_bytes,
+        codec_bytes=float(raw_bytes),
+        anchor_bytes=0,
+        payload_bytes=float(raw_bytes),
+        scale_bytes=0,
+    )
+
+
+def _make_raw_fp16_codec_result(tensor: torch.Tensor, codec_name: str) -> TensorCodecResult:
+    """Treat the original tensor as FP16-stored raw data."""
+
     raw_bytes = _raw_bytes(tensor)
     return TensorCodecResult(
         codec_name=codec_name,
@@ -196,12 +217,20 @@ def encode_previous_token_residual(
         raise ValueError("Tensor must contain at least one token.")
 
     anchor, residuals = _build_previous_token_residuals(tensor)
-    quantized, scales, dequantized = _apply_block_quantization(residuals, bit_width=bit_width, group_size=group_size)
-    reconstructed = _reconstruct_previous_token(anchor, dequantized)
-
     anchor_bytes = anchor.numel() * RAW_DTYPE_BYTES
-    payload_bytes = _payload_bytes(quantized.numel(), bit_width)
-    scale_bytes = scales.numel() * 4
+
+    if bit_width == 16:
+        quantized = torch.empty_like(residuals, dtype=torch.int8)
+        scales = torch.empty((tensor.shape[0], tensor.shape[1], 0), dtype=torch.float32, device=tensor.device)
+        dequantized = residuals.float()
+        payload_bytes = _payload_bytes(residuals.numel(), bit_width)
+        scale_bytes = 0
+    else:
+        quantized, scales, dequantized = _apply_block_quantization(residuals, bit_width=bit_width, group_size=group_size)
+        payload_bytes = _payload_bytes(quantized.numel(), bit_width)
+        scale_bytes = scales.numel() * 4
+
+    reconstructed = _reconstruct_previous_token(anchor, dequantized)
     codec_bytes = anchor_bytes + payload_bytes + scale_bytes
 
     return TensorCodecResult(
@@ -237,27 +266,39 @@ def encode_anchor_group_residual(
         if residual_block.shape[-2] == 0:
             quantized_blocks.append(torch.empty_like(residual_block, dtype=torch.int8))
             dequantized_blocks.append(torch.empty_like(residual_block, dtype=torch.float32))
-            scale_values.append(torch.ones((*residual_block.shape[:2], 1), dtype=torch.float32, device=tensor.device))
+            if bit_width != 16:
+                scale_values.append(torch.ones((*residual_block.shape[:2], 1), dtype=torch.float32, device=tensor.device))
             continue
 
-        quantized_block, scales_block, dequantized_block = _apply_block_quantization(
-            residual_block,
-            bit_width=bit_width,
-            group_size=max(1, residual_block.shape[-2]),
-        )
-        quantized_blocks.append(quantized_block)
-        dequantized_blocks.append(dequantized_block)
-        scale_values.append(scales_block)
+        if bit_width == 16:
+            quantized_blocks.append(torch.empty_like(residual_block, dtype=torch.int8))
+            dequantized_blocks.append(residual_block.float())
+        else:
+            quantized_block, scales_block, dequantized_block = _apply_block_quantization(
+                residual_block,
+                bit_width=bit_width,
+                group_size=max(1, residual_block.shape[-2]),
+            )
+            quantized_blocks.append(quantized_block)
+            dequantized_blocks.append(dequantized_block)
+            scale_values.append(scales_block)
 
-    quantized = torch.cat(quantized_blocks, dim=-2) if quantized_blocks else torch.empty_like(tensor[..., :0, :], dtype=torch.int8)
-    scales = torch.cat(scale_values, dim=-1) if scale_values else torch.empty(
-        (tensor.shape[0], tensor.shape[1], 0), dtype=torch.float32, device=tensor.device
+    quantized = (
+        torch.cat(quantized_blocks, dim=-2)
+        if quantized_blocks
+        else torch.empty_like(tensor[..., :0, :], dtype=torch.int8)
+    )
+    scales = (
+        torch.cat(scale_values, dim=-1)
+        if scale_values
+        else torch.empty((tensor.shape[0], tensor.shape[1], 0), dtype=torch.float32, device=tensor.device)
     )
     reconstructed = _reconstruct_anchor_group(anchors, dequantized_blocks, spans)
 
     anchor_bytes = anchors.numel() * RAW_DTYPE_BYTES
-    payload_bytes = _payload_bytes(quantized.numel(), bit_width)
-    scale_bytes = scales.numel() * 4
+    residual_numel = sum(block.numel() for block in residual_blocks)
+    payload_bytes = _payload_bytes(residual_numel, bit_width)
+    scale_bytes = scales.numel() * 4 if bit_width != 16 else 0
     codec_bytes = anchor_bytes + payload_bytes + scale_bytes
 
     return TensorCodecResult(
@@ -343,6 +384,40 @@ def encode_raw_baseline(tensor: torch.Tensor, codec_name: str = "raw") -> Tensor
 
     _validate_kv_tensor_shape(tensor)
     return _make_identity_codec_result(tensor, codec_name=codec_name)
+
+
+def encode_raw_tensor(
+    tensor: torch.Tensor,
+    bit_width: int,
+    group_size: int,
+    codec_name: str,
+) -> TensorCodecResult:
+    """Store the tensor directly, either as FP16 or as quantized packed values."""
+
+    _validate_kv_tensor_shape(tensor)
+    _validate_bit_width(bit_width)
+
+    if bit_width == 16:
+        return _make_raw_fp16_codec_result(tensor, codec_name=codec_name)
+
+    quantized, scales, dequantized = _apply_block_quantization(tensor, bit_width=bit_width, group_size=group_size)
+    payload_bytes = _payload_bytes(quantized.numel(), bit_width)
+    scale_bytes = scales.numel() * 4
+    codec_bytes = payload_bytes + scale_bytes
+
+    return TensorCodecResult(
+        codec_name=codec_name,
+        quantized_values=quantized,
+        scales=scales,
+        reconstructed=dequantized,
+        mse=mean_squared_energy(tensor.float() - dequantized),
+        cosine_similarity=cosine_similarity(tensor, dequantized),
+        raw_bytes=_raw_bytes(tensor),
+        codec_bytes=codec_bytes,
+        anchor_bytes=0,
+        payload_bytes=payload_bytes,
+        scale_bytes=scale_bytes,
+    )
 
 
 def qk_logit_mae(last_query: torch.Tensor, raw_k: torch.Tensor, reconstructed_k: torch.Tensor, scaling: float) -> float:
