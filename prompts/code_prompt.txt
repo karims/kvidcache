@@ -1,3 +1,55 @@
-Write a small Python function that parses a CSV file with headers, validates that each row has the same number of columns, and returns a list of dictionaries.
+You are reviewing a Python backend utility module for a small internal data-processing service.
 
-Keep the implementation clean and include a short explanation of the design choices.
+The service receives CSV exports from several vendors. Each vendor sends files with headers, but the files are not always clean. Some rows have missing columns, some rows have extra columns, some fields contain leading/trailing whitespace, and some files contain empty lines. The team wants a small, dependency-free CSV parser that uses only the Python standard library.
+
+Write a Python module that implements the following:
+
+1. A function named `parse_csv_records(path: str) -> list[dict[str, str]]`.
+
+2. The function should:
+
+   * Open the CSV file using UTF-8 encoding.
+   * Read the first row as headers.
+   * Strip whitespace from header names.
+   * Reject files with no header row.
+   * Reject files with duplicate header names.
+   * Reject files with empty header names.
+   * Skip completely empty rows.
+   * For every non-empty data row, verify that the number of columns exactly matches the number of headers.
+   * Strip leading and trailing whitespace from every field.
+   * Return a list of dictionaries mapping header names to field values.
+
+3. If validation fails, raise a custom exception named `CsvValidationError`.
+
+4. Include useful error messages. For example:
+
+   * missing header row
+   * duplicate header name
+   * empty header name
+   * row has too few columns
+   * row has too many columns
+
+5. Include a helper function named `_is_empty_row(row: list[str]) -> bool`.
+
+6. Include type hints.
+
+7. Include docstrings for public functions and classes.
+
+8. Include a few small inline examples in comments showing valid and invalid CSV rows.
+
+9. After the implementation, write a short explanation of the design choices:
+
+   * why the standard `csv` module is used
+   * why validation is done while reading rows
+   * why a custom exception is useful
+   * what assumptions the parser makes
+
+10. Keep the code clean and readable. Do not over-engineer it. Do not use pandas or any external libraries.
+
+Here is some additional context about how this module will be used:
+
+The parser will be called from a batch job. The batch job processes many files in a directory. If one file is invalid, the job should report the file name and the validation error, then continue with the next file. The parser itself should only parse one file and raise errors clearly. It should not print anything, log anything, or exit the program.
+
+The team also wants future maintainers to understand the validation logic easily, so avoid clever one-liners. Prefer straightforward loops and small helper functions. The goal is reliability and clarity, not maximum compactness.
+
+Please return the complete Python code first, followed by the explanation.
