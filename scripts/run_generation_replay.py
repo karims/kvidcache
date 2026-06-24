@@ -1,0 +1,298 @@
+"""Run Phase 3B short generation replay with teacher-forced compressed KV."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+
+import torch
+from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, eager_attention_forward
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from kvidcache.capture import load_model_and_tokenizer, load_prompt, normalize_past_key_values, prepare_prompt_text
+from kvidcache.codec import encode_anchor_group_residual, encode_previous_token_residual
+from kvidcache.metrics import cosine_similarity
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct", help="Hugging Face model name or path.")
+    parser.add_argument("--prompt-file", default="prompts/code_prompt.txt", help="Prompt file to analyze.")
+    parser.add_argument("--group-size", type=int, default=8, help="Token group size for the codecs.")
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to run on, for example `cpu` or `cuda`.",
+    )
+    parser.add_argument("--max-tokens", type=int, default=1024, help="Maximum number of prompt tokens to keep.")
+    parser.add_argument("--max-new-tokens", type=int, default=50, help="Number of greedy continuation steps to test.")
+    return parser
+
+
+def tokenize_prompt(tokenizer, prompt: str, max_tokens: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the tokenizer chat template and tokenize the prompt."""
+
+    formatted_prompt = prepare_prompt_text(tokenizer, prompt)
+    encoded = tokenizer(
+        formatted_prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_tokens,
+    )
+    return encoded["input_ids"].to(device), encoded["attention_mask"].to(device)
+
+
+def compress_prefix_cache(
+    prefix_past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    group_size: int,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    """Reconstruct prefix KV with the current best codec choice."""
+
+    reconstructed_layers = []
+    for raw_k, raw_v in prefix_past_key_values:
+        reconstructed_k = encode_previous_token_residual(
+            raw_k,
+            bit_width=8,
+            group_size=group_size,
+            codec_name="k-prev-int8",
+        ).reconstructed.to(dtype=raw_k.dtype)
+        reconstructed_v = encode_anchor_group_residual(
+            raw_v,
+            bit_width=4,
+            group_size=group_size,
+            codec_name="v-anchor-int4",
+        ).reconstructed.to(dtype=raw_v.dtype)
+        reconstructed_layers.append((reconstructed_k, reconstructed_v))
+    return tuple(reconstructed_layers)
+
+
+def run_attention_with_prefix(attention, hidden_states: torch.Tensor, position_embeddings, past_k: torch.Tensor, past_v: torch.Tensor) -> torch.Tensor:
+    """Run one attention step for a single token against reconstructed prefix KV."""
+
+    hidden_shape = (*hidden_states.shape[:-1], -1, attention.head_dim)
+    query_states = attention.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = attention.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = attention.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    full_k = torch.cat([past_k.to(dtype=key_states.dtype), key_states], dim=-2)
+    full_v = torch.cat([past_v.to(dtype=value_states.dtype), value_states], dim=-2)
+    attn_output, _ = eager_attention_forward(
+        attention,
+        query_states,
+        full_k,
+        full_v,
+        attention_mask=None,
+        scaling=attention.scaling,
+        dropout=0.0,
+    )
+    attn_output = attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous()
+    return attention.o_proj(attn_output)
+
+
+def replay_one_step_with_reconstructed_prefix(
+    model,
+    current_token_id: torch.Tensor,
+    reconstructed_prefix_kv: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    prefix_length: int,
+) -> torch.Tensor:
+    """Replay one token through the decoder using reconstructed prefix KV."""
+
+    hidden_states = model.model.embed_tokens(current_token_id)
+    position_ids = torch.tensor([[prefix_length]], device=current_token_id.device)
+    position_embeddings = model.model.rotary_emb(hidden_states, position_ids)
+
+    for layer_index, decoder_layer in enumerate(model.model.layers):
+        residual = hidden_states
+        hidden_states = decoder_layer.input_layernorm(hidden_states)
+
+        past_k, past_v = reconstructed_prefix_kv[layer_index]
+        attn_output = run_attention_with_prefix(
+            decoder_layer.self_attn,
+            hidden_states,
+            position_embeddings,
+            past_k,
+            past_v,
+        )
+        hidden_states = residual + attn_output
+
+        residual = hidden_states
+        hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
+        hidden_states = decoder_layer.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+    hidden_states = model.model.norm(hidden_states)
+    return model.lm_head(hidden_states).detach()
+
+
+def topk_overlap_count(raw_logits: torch.Tensor, replay_logits: torch.Tensor, k: int) -> int:
+    """Count overlap between the top-k token sets."""
+
+    raw_topk = set(torch.topk(raw_logits[0, -1], k=k).indices.tolist())
+    replay_topk = set(torch.topk(replay_logits[0, -1], k=k).indices.tolist())
+    return len(raw_topk.intersection(replay_topk))
+
+
+def raw_greedy_generate(model, input_ids: torch.Tensor, attention_mask: torch.Tensor, max_new_tokens: int) -> tuple[list[int], list[torch.Tensor]]:
+    """Generate a short raw greedy continuation and capture per-step logits."""
+
+    generated_tokens: list[int] = []
+    step_logits: list[torch.Tensor] = []
+    current_ids = input_ids
+    current_mask = attention_mask
+
+    for _ in range(max_new_tokens):
+        with torch.no_grad():
+            outputs = model(
+                input_ids=current_ids,
+                attention_mask=current_mask,
+                use_cache=False,
+            )
+
+        logits = outputs.logits[:, -1:, :].detach()
+        next_token = int(torch.argmax(logits[0, -1]).item())
+        generated_tokens.append(next_token)
+        step_logits.append(logits)
+
+        next_token_tensor = torch.tensor([[next_token]], device=current_ids.device)
+        current_ids = torch.cat([current_ids, next_token_tensor], dim=1)
+        current_mask = torch.cat([current_mask, torch.ones_like(next_token_tensor)], dim=1)
+
+    return generated_tokens, step_logits
+
+
+def teacher_forced_compressed_replay(
+    model,
+    prompt_ids: torch.Tensor,
+    raw_generated_tokens: list[int],
+    group_size: int,
+) -> tuple[list[int], list[torch.Tensor]]:
+    """Use raw tokens as context each step, but compute logits with reconstructed KV."""
+
+    replay_tokens: list[int] = []
+    replay_logits_per_step: list[torch.Tensor] = []
+
+    context_ids = prompt_ids.clone()
+    for raw_token in raw_generated_tokens:
+        if context_ids.shape[-1] < 2:
+            raise ValueError("Need at least two context tokens for one-step replay.")
+
+        prefix_ids = context_ids[:, :-1]
+        current_token_id = context_ids[:, -1:]
+        prefix_mask = torch.ones_like(prefix_ids)
+
+        with torch.no_grad():
+            prefix_outputs = model(
+                input_ids=prefix_ids,
+                attention_mask=prefix_mask,
+                use_cache=True,
+            )
+
+        reconstructed_prefix_kv = compress_prefix_cache(
+            normalize_past_key_values(prefix_outputs.past_key_values),
+            group_size=group_size,
+        )
+        replay_logits = replay_one_step_with_reconstructed_prefix(
+            model=model,
+            current_token_id=current_token_id,
+            reconstructed_prefix_kv=reconstructed_prefix_kv,
+            prefix_length=int(prefix_ids.shape[-1]),
+        )
+
+        replay_token = int(torch.argmax(replay_logits[0, -1]).item())
+        replay_tokens.append(replay_token)
+        replay_logits_per_step.append(replay_logits)
+
+        next_raw_token_tensor = torch.tensor([[raw_token]], device=context_ids.device)
+        context_ids = torch.cat([context_ids, next_raw_token_tensor], dim=1)
+
+    return replay_tokens, replay_logits_per_step
+
+
+def find_first_divergence(raw_tokens: list[int], replay_tokens: list[int]) -> int | None:
+    """Return the first 1-based generation step where tokens diverge."""
+
+    for index, (raw_token, replay_token) in enumerate(zip(raw_tokens, replay_tokens), start=1):
+        if raw_token != replay_token:
+            return index
+    return None
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
+    device = torch.device(args.device)
+
+    model, tokenizer = load_model_and_tokenizer(args.model, device)
+    if hasattr(model.config, "_attn_implementation"):
+        model.config._attn_implementation = "eager"
+
+    prompt = load_prompt(args.prompt_file)
+    input_ids, attention_mask = tokenize_prompt(tokenizer, prompt, args.max_tokens, device)
+    if input_ids.shape[-1] < 2:
+        raise ValueError("Need at least two prompt tokens for teacher-forced replay.")
+
+    raw_generated_tokens, raw_logits_per_step = raw_greedy_generate(
+        model=model,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=args.max_new_tokens,
+    )
+    replay_generated_tokens, replay_logits_per_step = teacher_forced_compressed_replay(
+        model=model,
+        prompt_ids=input_ids,
+        raw_generated_tokens=raw_generated_tokens,
+        group_size=args.group_size,
+    )
+
+    token_match_count = sum(int(raw_token == replay_token) for raw_token, replay_token in zip(raw_generated_tokens, replay_generated_tokens))
+    token_match_rate = token_match_count / len(raw_generated_tokens) if raw_generated_tokens else 0.0
+    first_divergence = find_first_divergence(raw_generated_tokens, replay_generated_tokens)
+
+    logit_cosines = [
+        cosine_similarity(raw_logits, replay_logits)
+        for raw_logits, replay_logits in zip(raw_logits_per_step, replay_logits_per_step)
+    ]
+    average_logit_cosine = sum(logit_cosines) / len(logit_cosines) if logit_cosines else 0.0
+    worst_logit_cosine = min(logit_cosines) if logit_cosines else 0.0
+    top1_agreement_count = token_match_count
+    top5_overlap_average = (
+        sum(topk_overlap_count(raw_logits, replay_logits, k=5) / 5.0 for raw_logits, replay_logits in zip(raw_logits_per_step, replay_logits_per_step))
+        / len(raw_logits_per_step)
+        if raw_logits_per_step
+        else 0.0
+    )
+
+    raw_text = tokenizer.decode(raw_generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    replay_text = tokenizer.decode(replay_generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+    print("mode: teacher-forced compressed replay")
+    print(f"model name: {args.model}")
+    print(f"prompt token count: {input_ids.shape[-1]}")
+    print(f"group size: {args.group_size}")
+    print(f"max new tokens: {args.max_new_tokens}")
+    print()
+    print("raw generated text:")
+    print(raw_text)
+    print()
+    print("compressed generated text:")
+    print(replay_text)
+    print()
+    print(f"token match count: {token_match_count}")
+    print(f"token match rate: {token_match_rate:.4f}")
+    print(f"first divergence position: {first_divergence if first_divergence is not None else 'none'}")
+    print(f"average logit cosine: {average_logit_cosine:.8f}")
+    print(f"worst logit cosine: {worst_logit_cosine:.8f}")
+    print(f"top-1 agreement count: {top1_agreement_count}")
+    print(f"top-5 overlap average: {top5_overlap_average:.4f}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
