@@ -15,7 +15,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from kvidcache.capture import capture_prompt_kv, load_model_and_tokenizer, load_prompt
-from kvidcache.codec import encode_k_previous_token_int8, qk_logit_mae
+from kvidcache.codec import encode_previous_token_residual, qk_logit_mae
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -117,7 +117,12 @@ def main() -> int:
         if position_embeddings is None:
             raise ValueError(f"Missing position embeddings for layer {layer_index}.")
 
-        codec_result = encode_k_previous_token_int8(raw_k, group_size=args.group_size)
+        codec_result = encode_previous_token_residual(
+            raw_k,
+            bit_width=8,
+            group_size=args.group_size,
+            codec_name="k-prev-int8",
+        )
         last_query = compute_last_token_query(model, layer_index, layer_input, position_embeddings)
         raw_k_for_logits = repeat_kv(raw_k, model.model.layers[layer_index].self_attn.num_key_value_groups)
         reconstructed_k_for_logits = repeat_kv(
@@ -130,19 +135,19 @@ def main() -> int:
             scaling=model.model.layers[layer_index].self_attn.scaling,
         )
 
-        total_raw_k_bytes += codec_result.raw_k_bytes
-        total_codec_k_bytes += codec_result.codec_k_bytes
+        total_raw_k_bytes += codec_result.raw_bytes
+        total_codec_k_bytes += codec_result.codec_bytes
         total_raw_v_bytes += raw_v.numel() * 2
 
         layer_rows.append(
             {
                 "layer": layer_index,
-                "k_reconstruction_mse": codec_result.reconstruction_mse,
-                "k_cosine_similarity": codec_result.reconstruction_cosine_similarity,
+                "k_reconstruction_mse": codec_result.mse,
+                "k_cosine_similarity": codec_result.cosine_similarity,
                 "qk_logit_mae": logit_mae,
-                "raw_k_bytes": codec_result.raw_k_bytes,
-                "codec_k_bytes": codec_result.codec_k_bytes,
-                "k_compression_ratio": codec_result.raw_k_bytes / codec_result.codec_k_bytes,
+                "raw_k_bytes": codec_result.raw_bytes,
+                "codec_k_bytes": codec_result.codec_bytes,
+                "k_compression_ratio": codec_result.raw_bytes / codec_result.codec_bytes,
             }
         )
 
