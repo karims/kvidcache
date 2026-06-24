@@ -41,6 +41,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=1024, help="Maximum number of prompt tokens to keep.")
     parser.add_argument("--max-new-tokens", type=int, default=50, help="Number of greedy continuation steps to test.")
     parser.add_argument(
+        "--recent-raw-tokens",
+        type=int,
+        default=0,
+        help="Keep this many most-recent KV tokens raw FP16 while compressing older tokens.",
+    )
+    parser.add_argument(
         "--mode",
         default="teacher-forced",
         choices=["teacher-forced", "free-running"],
@@ -90,55 +96,99 @@ def compress_prefix_cache(
     k_bits: int,
     v_bits: int,
     group_size: int,
+    recent_raw_tokens: int,
 ) -> tuple[tuple[tuple[torch.Tensor, torch.Tensor], tuple[float, float, float, float]], ...]:
     """Reconstruct prefix KV and return per-layer raw/codec byte estimates."""
 
     reconstructed_layers = []
     for raw_k, raw_v in prefix_past_key_values:
-        if k_codec == "raw":
-            k_result = encode_raw_tensor(
-                raw_k,
-                bit_width=k_bits,
-                group_size=group_size,
-                codec_name=f"k-raw-int{k_bits}",
-            )
-        elif k_codec == "prev-residual":
-            k_result = encode_previous_token_residual(
-                raw_k,
-                bit_width=k_bits,
-                group_size=group_size,
-                codec_name=f"k-{k_codec}-int{k_bits}",
-            )
-        else:
-            raise ValueError(f"Unsupported K codec: {k_codec}")
+        seq_len = raw_k.shape[-2]
+        recent_count = min(max(recent_raw_tokens, 0), seq_len)
+        compressed_len = seq_len - recent_count
 
-        if v_codec == "raw":
-            v_result = encode_raw_tensor(
-                raw_v,
-                bit_width=v_bits,
-                group_size=group_size,
-                codec_name=f"v-raw-int{v_bits}",
-            )
-        elif v_codec == "anchor-residual":
-            v_result = encode_anchor_group_residual(
-                raw_v,
-                bit_width=v_bits,
-                group_size=group_size,
-                codec_name=f"v-{v_codec}-int{v_bits}",
-            )
+        compressed_k_slice = raw_k[..., :compressed_len, :]
+        compressed_v_slice = raw_v[..., :compressed_len, :]
+        recent_k_slice = raw_k[..., compressed_len:, :]
+        recent_v_slice = raw_v[..., compressed_len:, :]
+
+        if compressed_len > 0:
+            if k_codec == "raw":
+                k_result = encode_raw_tensor(
+                    compressed_k_slice,
+                    bit_width=k_bits,
+                    group_size=group_size,
+                    codec_name=f"k-raw-int{k_bits}",
+                )
+            elif k_codec == "prev-residual":
+                k_result = encode_previous_token_residual(
+                    compressed_k_slice,
+                    bit_width=k_bits,
+                    group_size=group_size,
+                    codec_name=f"k-{k_codec}-int{k_bits}",
+                )
+            else:
+                raise ValueError(f"Unsupported K codec: {k_codec}")
+
+            if v_codec == "raw":
+                v_result = encode_raw_tensor(
+                    compressed_v_slice,
+                    bit_width=v_bits,
+                    group_size=group_size,
+                    codec_name=f"v-raw-int{v_bits}",
+                )
+            elif v_codec == "anchor-residual":
+                v_result = encode_anchor_group_residual(
+                    compressed_v_slice,
+                    bit_width=v_bits,
+                    group_size=group_size,
+                    codec_name=f"v-{v_codec}-int{v_bits}",
+                )
+            else:
+                raise ValueError(f"Unsupported V codec: {v_codec}")
         else:
-            raise ValueError(f"Unsupported V codec: {v_codec}")
+            k_result = encode_raw_tensor(
+                compressed_k_slice,
+                bit_width=16,
+                group_size=group_size,
+                codec_name="k-empty-int16",
+            )
+            v_result = encode_raw_tensor(
+                compressed_v_slice,
+                bit_width=16,
+                group_size=group_size,
+                codec_name="v-empty-int16",
+            )
+
+        reconstructed_k = (
+            torch.cat(
+                [k_result.reconstructed.detach().to(dtype=raw_k.dtype), recent_k_slice.detach()],
+                dim=-2,
+            )
+            if recent_count > 0
+            else k_result.reconstructed.detach().to(dtype=raw_k.dtype)
+        )
+        reconstructed_v = (
+            torch.cat(
+                [v_result.reconstructed.detach().to(dtype=raw_v.dtype), recent_v_slice.detach()],
+                dim=-2,
+            )
+            if recent_count > 0
+            else v_result.reconstructed.detach().to(dtype=raw_v.dtype)
+        )
+
+        recent_k_bytes = float(recent_k_slice.numel() * 2)
+        recent_v_bytes = float(recent_v_slice.numel() * 2)
         reconstructed_layers.append(
             (
                 (
-                    k_result.reconstructed.detach().to(dtype=raw_k.dtype),
-                    v_result.reconstructed.detach().to(dtype=raw_v.dtype),
+                    reconstructed_k,
+                    reconstructed_v,
                 ),
                 (
-                    float(k_result.raw_bytes),
-                    float(k_result.codec_bytes),
-                    float(v_result.raw_bytes),
-                    float(v_result.codec_bytes),
+                    float(raw_k.numel() * 2),
+                    float(k_result.codec_bytes) + recent_k_bytes,
+                    float(raw_v.numel() * 2),
+                    float(v_result.codec_bytes) + recent_v_bytes,
                 ),
             )
         )
@@ -256,6 +306,7 @@ def compressed_replay_generate(
     k_bits: int,
     v_bits: int,
     group_size: int,
+    recent_raw_tokens: int,
     mode: str,
 ) -> tuple[list[int], list[torch.Tensor]]:
     """Run compressed replay in teacher-forced or free-running mode."""
@@ -286,6 +337,7 @@ def compressed_replay_generate(
                 k_bits=k_bits,
                 v_bits=v_bits,
                 group_size=group_size,
+                recent_raw_tokens=recent_raw_tokens,
             )
             replay_logits = replay_one_step_with_reconstructed_prefix(
                 model=model,
@@ -354,6 +406,7 @@ def main() -> int:
         k_bits=args.k_bits,
         v_bits=args.v_bits,
         group_size=args.group_size,
+        recent_raw_tokens=args.recent_raw_tokens,
     )
     total_raw_k_bytes = sum(layer_bytes[0] for _, layer_bytes in prompt_codec_layers)
     total_codec_k_bytes = sum(layer_bytes[1] for _, layer_bytes in prompt_codec_layers)
@@ -378,6 +431,7 @@ def main() -> int:
         k_bits=args.k_bits,
         v_bits=args.v_bits,
         group_size=args.group_size,
+        recent_raw_tokens=args.recent_raw_tokens,
         mode=args.mode,
     )
 
@@ -409,6 +463,7 @@ def main() -> int:
     print(f"selected K codec: {args.k_codec} int{args.k_bits}")
     print(f"selected V codec: {args.v_codec} int{args.v_bits}")
     print(f"group size: {args.group_size}")
+    print(f"recent raw tokens: {args.recent_raw_tokens}")
     print(f"max new tokens: {args.max_new_tokens}")
     print(f"estimated full KV compression ratio: {estimated_full_kv_compression_ratio:.4f}")
     print()
