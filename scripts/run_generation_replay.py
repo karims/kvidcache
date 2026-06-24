@@ -62,6 +62,15 @@ def tokenize_prompt(tokenizer, prompt: str, max_tokens: int, device: torch.devic
     return encoded["input_ids"].to(device), encoded["attention_mask"].to(device)
 
 
+def get_peak_cuda_memory_allocated(device: torch.device) -> int:
+    """Return peak allocated CUDA memory in bytes for the selected device."""
+
+    if device.type != "cuda":
+        return 0
+
+    return int(torch.cuda.max_memory_allocated(device))
+
+
 def compress_prefix_cache(
     prefix_past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...],
     k_codec: str,
@@ -110,8 +119,8 @@ def compress_prefix_cache(
         reconstructed_layers.append(
             (
                 (
-                    k_result.reconstructed.to(dtype=raw_k.dtype),
-                    v_result.reconstructed.to(dtype=raw_v.dtype),
+                    k_result.reconstructed.detach().to(dtype=raw_k.dtype),
+                    v_result.reconstructed.detach().to(dtype=raw_v.dtype),
                 ),
                 (
                     float(k_result.raw_bytes),
@@ -158,31 +167,32 @@ def replay_one_step_with_reconstructed_prefix(
 ) -> torch.Tensor:
     """Replay one token through the decoder using reconstructed prefix KV."""
 
-    hidden_states = model.model.embed_tokens(current_token_id)
-    position_ids = torch.tensor([[prefix_length]], device=current_token_id.device)
-    position_embeddings = model.model.rotary_emb(hidden_states, position_ids)
+    with torch.inference_mode():
+        hidden_states = model.model.embed_tokens(current_token_id)
+        position_ids = torch.tensor([[prefix_length]], device=current_token_id.device)
+        position_embeddings = model.model.rotary_emb(hidden_states, position_ids)
 
-    for layer_index, decoder_layer in enumerate(model.model.layers):
-        residual = hidden_states
-        hidden_states = decoder_layer.input_layernorm(hidden_states)
+        for layer_index, decoder_layer in enumerate(model.model.layers):
+            residual = hidden_states
+            hidden_states = decoder_layer.input_layernorm(hidden_states)
 
-        past_k, past_v = reconstructed_prefix_kv[layer_index]
-        attn_output = run_attention_with_prefix(
-            decoder_layer.self_attn,
-            hidden_states,
-            position_embeddings,
-            past_k,
-            past_v,
-        )
-        hidden_states = residual + attn_output
+            past_k, past_v = reconstructed_prefix_kv[layer_index]
+            attn_output = run_attention_with_prefix(
+                decoder_layer.self_attn,
+                hidden_states,
+                position_embeddings,
+                past_k,
+                past_v,
+            )
+            hidden_states = residual + attn_output
 
-        residual = hidden_states
-        hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
-        hidden_states = decoder_layer.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
+            hidden_states = decoder_layer.mlp(hidden_states)
+            hidden_states = residual + hidden_states
 
-    hidden_states = model.model.norm(hidden_states)
-    return model.lm_head(hidden_states).detach()
+        hidden_states = model.model.norm(hidden_states)
+        return model.lm_head(hidden_states).detach()
 
 
 def topk_overlap_count(raw_logits: torch.Tensor, replay_logits: torch.Tensor, k: int) -> int:
@@ -197,28 +207,32 @@ def raw_greedy_generate(model, input_ids: torch.Tensor, attention_mask: torch.Te
     """Generate a short raw greedy continuation and capture per-step logits."""
 
     generated_tokens: list[int] = []
-    step_logits: list[torch.Tensor] = []
+    step_logits_list: list[torch.Tensor] = []
     current_ids = input_ids
     current_mask = attention_mask
 
-    for _ in range(max_new_tokens):
-        with torch.no_grad():
+    for step_index in range(max_new_tokens):
+        with torch.inference_mode():
             outputs = model(
                 input_ids=current_ids,
                 attention_mask=current_mask,
                 use_cache=False,
             )
 
-        logits = outputs.logits[:, -1:, :].detach()
-        next_token = int(torch.argmax(logits[0, -1]).item())
+        step_logits_cpu = outputs.logits[:, -1, :].detach().float().cpu()
+        next_token = int(torch.argmax(step_logits_cpu[0]).item())
         generated_tokens.append(next_token)
-        step_logits.append(logits)
+        step_logits_list.append(step_logits_cpu)
 
         next_token_tensor = torch.tensor([[next_token]], device=current_ids.device)
         current_ids = torch.cat([current_ids, next_token_tensor], dim=1)
         current_mask = torch.cat([current_mask, torch.ones_like(next_token_tensor)], dim=1)
 
-    return generated_tokens, step_logits
+        del outputs, step_logits_cpu, next_token_tensor
+        if current_ids.device.type == "cuda" and (step_index + 1) % 25 == 0:
+            torch.cuda.empty_cache()
+
+    return generated_tokens, step_logits_list
 
 
 def compressed_replay_generate(
@@ -238,7 +252,7 @@ def compressed_replay_generate(
     replay_logits_per_step: list[torch.Tensor] = []
 
     context_ids = prompt_ids.clone()
-    for raw_token in raw_generated_tokens:
+    for step_index, raw_token in enumerate(raw_generated_tokens):
         if context_ids.shape[-1] < 2:
             raise ValueError("Need at least two context tokens for one-step replay.")
 
@@ -246,31 +260,32 @@ def compressed_replay_generate(
         current_token_id = context_ids[:, -1:]
         prefix_mask = torch.ones_like(prefix_ids)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             prefix_outputs = model(
                 input_ids=prefix_ids,
                 attention_mask=prefix_mask,
                 use_cache=True,
             )
 
-        reconstructed_prefix_kv = compress_prefix_cache(
-            normalize_past_key_values(prefix_outputs.past_key_values),
-            k_codec=k_codec,
-            v_codec=v_codec,
-            k_bits=k_bits,
-            v_bits=v_bits,
-            group_size=group_size,
-        )
-        replay_logits = replay_one_step_with_reconstructed_prefix(
-            model=model,
-            current_token_id=current_token_id,
-            reconstructed_prefix_kv=tuple(layer_pair for layer_pair, _ in reconstructed_prefix_kv),
-            prefix_length=int(prefix_ids.shape[-1]),
-        )
+            reconstructed_prefix_kv = compress_prefix_cache(
+                normalize_past_key_values(prefix_outputs.past_key_values),
+                k_codec=k_codec,
+                v_codec=v_codec,
+                k_bits=k_bits,
+                v_bits=v_bits,
+                group_size=group_size,
+            )
+            replay_logits = replay_one_step_with_reconstructed_prefix(
+                model=model,
+                current_token_id=current_token_id,
+                reconstructed_prefix_kv=tuple(layer_pair for layer_pair, _ in reconstructed_prefix_kv),
+                prefix_length=int(prefix_ids.shape[-1]),
+            )
 
-        replay_token = int(torch.argmax(replay_logits[0, -1]).item())
+        replay_step_logits = replay_logits[:, -1, :].detach().float().cpu()
+        replay_token = int(torch.argmax(replay_step_logits[0]).item())
         replay_tokens.append(replay_token)
-        replay_logits_per_step.append(replay_logits)
+        replay_logits_per_step.append(replay_step_logits)
 
         if mode == "teacher-forced":
             next_token = raw_token
@@ -281,6 +296,10 @@ def compressed_replay_generate(
 
         next_token_tensor = torch.tensor([[next_token]], device=context_ids.device)
         context_ids = torch.cat([context_ids, next_token_tensor], dim=1)
+
+        del prefix_outputs, reconstructed_prefix_kv, replay_logits, replay_step_logits, prefix_ids, current_token_id, prefix_mask, next_token_tensor
+        if context_ids.device.type == "cuda" and (step_index + 1) % 25 == 0:
+            torch.cuda.empty_cache()
 
     return replay_tokens, replay_logits_per_step
 
@@ -297,6 +316,8 @@ def find_first_divergence(raw_tokens: list[int], replay_tokens: list[int]) -> in
 def main() -> int:
     args = build_arg_parser().parse_args()
     device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     model, tokenizer = load_model_and_tokenizer(args.model, device)
     if hasattr(model.config, "_attn_implementation"):
@@ -307,7 +328,7 @@ def main() -> int:
     if input_ids.shape[-1] < 2:
         raise ValueError("Need at least two prompt tokens for teacher-forced replay.")
 
-    with torch.no_grad():
+    with torch.inference_mode():
         prompt_outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -368,6 +389,7 @@ def main() -> int:
 
     raw_text = tokenizer.decode(raw_generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     replay_text = tokenizer.decode(replay_generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    peak_cuda_memory_allocated = get_peak_cuda_memory_allocated(device)
 
     print(f"mode: {args.mode} compressed replay")
     print(f"model name: {args.model}")
@@ -391,6 +413,7 @@ def main() -> int:
     print(f"worst logit cosine: {worst_logit_cosine:.8f}")
     print(f"top-1 agreement count: {top1_agreement_count}")
     print(f"top-5 overlap average: {top5_overlap_average:.4f}")
+    print(f"peak CUDA memory allocated: {peak_cuda_memory_allocated}")
     return 0
 
 
