@@ -101,6 +101,12 @@ def _normalize_past_key_values(past_key_values: Any) -> tuple[tuple[torch.Tensor
     return tuple(validated_layers)
 
 
+def normalize_past_key_values(past_key_values: Any) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    """Public wrapper for cache normalization used by analysis scripts."""
+
+    return _normalize_past_key_values(past_key_values)
+
+
 @torch.no_grad()
 def capture_prompt_kv(
     model: Any,
