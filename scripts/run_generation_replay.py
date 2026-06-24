@@ -62,6 +62,18 @@ def tokenize_prompt(tokenizer, prompt: str, max_tokens: int, device: torch.devic
     return encoded["input_ids"].to(device), encoded["attention_mask"].to(device)
 
 
+def last_logits_vector(logits: torch.Tensor) -> torch.Tensor:
+    """Normalize logits to a 1D CPU float tensor of shape `[vocab]`."""
+
+    if logits.ndim == 3:
+        return logits[0, -1].detach().float().cpu()
+    if logits.ndim == 2:
+        return logits[0].detach().float().cpu()
+    if logits.ndim == 1:
+        return logits.detach().float().cpu()
+    raise ValueError(f"Unsupported logits shape: {tuple(logits.shape)}")
+
+
 def get_peak_cuda_memory_allocated(device: torch.device) -> int:
     """Return peak allocated CUDA memory in bytes for the selected device."""
 
@@ -198,8 +210,8 @@ def replay_one_step_with_reconstructed_prefix(
 def topk_overlap_count(raw_logits: torch.Tensor, replay_logits: torch.Tensor, k: int) -> int:
     """Count overlap between the top-k token sets."""
 
-    raw_topk = set(torch.topk(raw_logits[0, -1], k=k).indices.tolist())
-    replay_topk = set(torch.topk(replay_logits[0, -1], k=k).indices.tolist())
+    raw_topk = set(torch.topk(last_logits_vector(raw_logits), k=k).indices.tolist())
+    replay_topk = set(torch.topk(last_logits_vector(replay_logits), k=k).indices.tolist())
     return len(raw_topk.intersection(replay_topk))
 
 
@@ -219,8 +231,8 @@ def raw_greedy_generate(model, input_ids: torch.Tensor, attention_mask: torch.Te
                 use_cache=False,
             )
 
-        step_logits_cpu = outputs.logits[:, -1, :].detach().float().cpu()
-        next_token = int(torch.argmax(step_logits_cpu[0]).item())
+        step_logits_cpu = last_logits_vector(outputs.logits)
+        next_token = int(torch.argmax(step_logits_cpu).item())
         generated_tokens.append(next_token)
         step_logits_list.append(step_logits_cpu)
 
@@ -282,8 +294,8 @@ def compressed_replay_generate(
                 prefix_length=int(prefix_ids.shape[-1]),
             )
 
-        replay_step_logits = replay_logits[:, -1, :].detach().float().cpu()
-        replay_token = int(torch.argmax(replay_step_logits[0]).item())
+        replay_step_logits = last_logits_vector(replay_logits)
+        replay_token = int(torch.argmax(replay_step_logits).item())
         replay_tokens.append(replay_token)
         replay_logits_per_step.append(replay_step_logits)
 
